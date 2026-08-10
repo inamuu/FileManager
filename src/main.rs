@@ -5,10 +5,12 @@ use filemanager::{
     transfer::{SharedProgress, TransferState, start_copy},
 };
 use gpui::{
-    App, Application, Bounds, Context, IntoElement, Render, SharedString, Stateful, Timer, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, rgba, size,
+    App, Application, Bounds, ClickEvent, Context, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString, Stateful,
+    Timer, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, rgba, size,
 };
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -26,12 +28,21 @@ const BORDER: u32 = 0xd8dbe2;
 struct Tab {
     path: PathBuf,
     entries: Vec<FileEntry>,
+    selected: BTreeSet<PathBuf>,
+    selection_anchor: Option<usize>,
+    scroll_handle: ScrollHandle,
 }
 
 impl Tab {
     fn new(path: PathBuf) -> Self {
         let entries = read_directory(&path).unwrap_or_default();
-        Self { path, entries }
+        Self {
+            path,
+            entries,
+            selected: BTreeSet::new(),
+            selection_anchor: None,
+            scroll_handle: ScrollHandle::new(),
+        }
     }
 
     fn title(&self) -> String {
@@ -45,7 +56,7 @@ impl Tab {
 
 #[derive(Clone)]
 struct DraggedFile {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     name: String,
 }
 
@@ -60,7 +71,11 @@ impl Render for DraggedFile {
             .border_color(rgb(BORDER))
             .shadow_lg()
             .text_color(rgb(TEXT))
-            .child(format!("📄  {}", self.name))
+            .child(if self.paths.len() > 1 {
+                format!("📄  {}項目", self.paths.len())
+            } else {
+                format!("📄  {}", self.name)
+            })
     }
 }
 
@@ -68,6 +83,13 @@ impl Render for DraggedFile {
 struct DraggedPane {
     index: usize,
     title: String,
+}
+
+#[derive(Clone)]
+struct ContextMenu {
+    position: Point<Pixels>,
+    tab_index: usize,
+    paths: Vec<PathBuf>,
 }
 
 impl Render for DraggedPane {
@@ -92,6 +114,7 @@ struct FileManager {
     settings: Settings,
     transfers: Vec<SharedProgress>,
     status: Option<String>,
+    context_menu: Option<ContextMenu>,
 }
 
 impl FileManager {
@@ -103,6 +126,7 @@ impl FileManager {
             settings: Settings::load(),
             transfers: Vec::new(),
             status: None,
+            context_menu: None,
         }
     }
 
@@ -170,6 +194,150 @@ impl FileManager {
         self.tabs.insert(insert_at, tab);
         self.active_tab = insert_at;
         cx.notify();
+    }
+
+    fn select_entry(
+        &mut self,
+        tab_index: usize,
+        row: usize,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = &mut self.tabs[tab_index];
+        if row >= tab.entries.len() {
+            return;
+        }
+        let path = tab.entries[row].path.clone();
+        if modifiers.shift {
+            let anchor = tab.selection_anchor.unwrap_or(row);
+            let start = anchor.min(row);
+            let end = anchor.max(row);
+            if !modifiers.platform {
+                tab.selected.clear();
+            }
+            for entry in &tab.entries[start..=end] {
+                tab.selected.insert(entry.path.clone());
+            }
+        } else if modifiers.platform {
+            if !tab.selected.remove(&path) {
+                tab.selected.insert(path);
+            }
+            tab.selection_anchor = Some(row);
+        } else {
+            tab.selected.clear();
+            tab.selected.insert(path);
+            tab.selection_anchor = Some(row);
+        }
+        self.active_tab = tab_index;
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    fn click_entry(
+        &mut self,
+        tab_index: usize,
+        row: usize,
+        entry: &FileEntry,
+        event: &ClickEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.standard_click() {
+            return;
+        }
+        self.select_entry(tab_index, row, event.modifiers(), cx);
+        if event.click_count() >= 2 {
+            self.open_entry(tab_index, entry, cx);
+        }
+    }
+
+    fn show_context_menu(
+        &mut self,
+        tab_index: usize,
+        row: usize,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tabs[tab_index]
+            .selected
+            .contains(&self.tabs[tab_index].entries[row].path)
+        {
+            self.select_entry(tab_index, row, Modifiers::default(), cx);
+        }
+        let paths = self.tabs[tab_index].selected.iter().cloned().collect();
+        self.context_menu = Some(ContextMenu {
+            position: event.position,
+            tab_index,
+            paths,
+        });
+        self.active_tab = tab_index;
+        cx.notify();
+    }
+
+    fn open_context_item(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let entry = menu.paths.first().and_then(|path| {
+            self.tabs[menu.tab_index]
+                .entries
+                .iter()
+                .find(|entry| &entry.path == path)
+                .cloned()
+        });
+        if let Some(entry) = entry {
+            self.open_entry(menu.tab_index, &entry, cx);
+        }
+    }
+
+    fn reveal_context_item(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        if let Some(path) = menu.paths.first()
+            && Command::new("/usr/bin/open")
+                .arg("-R")
+                .arg(path)
+                .spawn()
+                .is_err()
+        {
+            self.status = Some("Finderで表示できませんでした".into());
+        }
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let count = menu.paths.len();
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("選択した{count}項目をゴミ箱に入れますか？"),
+            None,
+            &["ゴミ箱に入れる", "キャンセル"],
+            cx,
+        );
+        let paths = menu.paths;
+        cx.spawn(async move |this, cx| {
+            if prompt.await.unwrap_or(1) != 0 {
+                return;
+            }
+            let result = cx
+                .background_spawn(async move { move_to_trash(&paths) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for tab in &mut this.tabs {
+                    tab.entries = read_directory(&tab.path).unwrap_or_default();
+                    tab.selected.retain(|path| path.exists());
+                    tab.selection_anchor = None;
+                }
+                this.status = result
+                    .err()
+                    .map(|error| format!("削除できませんでした: {error}"));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn start_transfer(&mut self, source: PathBuf, tab_index: usize, cx: &mut Context<Self>) {
@@ -421,6 +589,7 @@ impl FileManager {
         let entries = tab.entries.clone();
         div()
             .flex_1()
+            .min_h(px(0.))
             .w_full()
             .flex()
             .flex_col()
@@ -443,10 +612,18 @@ impl FileManager {
                 div()
                     .id(("file-list", tab_index))
                     .flex_1()
+                    .min_h(px(0.))
                     .overflow_y_scroll()
+                    .scrollbar_width(px(8.))
+                    .track_scroll(&tab.scroll_handle)
                     .children(entries.into_iter().enumerate().map(|(index, entry)| {
+                        let selected = tab.selected.contains(&entry.path);
                         let dragged = DraggedFile {
-                            path: entry.path.clone(),
+                            paths: if selected && tab.selected.len() > 1 {
+                                tab.selected.iter().cloned().collect()
+                            } else {
+                                vec![entry.path.clone()]
+                            },
                             name: entry.name.clone(),
                         };
                         let clicked = entry.clone();
@@ -460,8 +637,11 @@ impl FileManager {
                             .border_color(rgb(0xf0f1f3))
                             .text_sm()
                             .text_color(rgb(TEXT))
+                            .bg(rgb(if selected { 0xd8e7ff } else { CARD }))
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0xf1f6ff)))
+                            .hover(move |style| {
+                                style.bg(rgb(if selected { 0xcadfff } else { 0xf1f6ff }))
+                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -477,9 +657,15 @@ impl FileManager {
                                     .text_color(rgb(MUTED))
                                     .child(entry.formatted_size()),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_entry(tab_index, &clicked, cx)
+                            .on_click(cx.listener(move |this, event, _, cx| {
+                                this.click_entry(tab_index, index, &clicked, event, cx)
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event, _, cx| {
+                                    this.show_context_menu(tab_index, index, event, cx)
+                                }),
+                            )
                             .on_drag(dragged, |file, _, _, cx| cx.new(|_| file.clone()))
                     })),
             )
@@ -489,6 +675,7 @@ impl FileManager {
         div()
             .id("panes")
             .flex_1()
+            .min_h(px(0.))
             .w_full()
             .flex()
             .gap_2()
@@ -506,6 +693,7 @@ impl FileManager {
                             .id(("pane", tab_index))
                             .min_w(px(360.))
                             .flex_1()
+                            .min_h(px(0.))
                             .h_full()
                             .flex()
                             .flex_col()
@@ -523,13 +711,57 @@ impl FileManager {
                             }))
                             .on_drop(cx.listener(move |this, file: &DraggedFile, _, cx| {
                                 this.active_tab = tab_index;
-                                this.start_transfer(file.path.clone(), tab_index, cx);
+                                for source in &file.paths {
+                                    this.start_transfer(source.clone(), tab_index, cx);
+                                }
                             }))
                             .on_drop(cx.listener(move |this, pane: &DraggedPane, _, cx| {
                                 this.move_pane(pane.index, tab_index, cx);
                             }))
                     }),
             )
+    }
+
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div().when_some(self.context_menu.clone(), |root, menu| {
+            root.child(
+                div()
+                    .absolute()
+                    .left(menu.position.x - px(224.))
+                    .top(menu.position.y)
+                    .w(px(220.))
+                    .p_1()
+                    .rounded_lg()
+                    .bg(rgba(0xfafafaf8))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .shadow_2xl()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}項目を選択中", menu.paths.len())),
+                    )
+                    .child(
+                        context_menu_item("context-open", "開く", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.open_context_item(cx))),
+                    )
+                    .child(
+                        context_menu_item("context-reveal", "Finderで表示", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.reveal_context_item(cx))),
+                    )
+                    .child(div().h(px(1.)).mx_2().my_1().bg(rgb(BORDER)))
+                    .child(
+                        context_menu_item("context-trash", "ゴミ箱に入れる", true).on_click(
+                            cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
+                        ),
+                    ),
+            )
+        })
     }
 
     fn render_transfer_panel(&self) -> impl IntoElement {
@@ -614,10 +846,16 @@ impl Render for FileManager {
         let has_transfers = !self.transfers.is_empty();
         let status = self.status.clone();
         div()
+            .id("filemanager-root")
             .size_full()
             .flex()
             .bg(rgb(BG))
             .font_family(".SystemUIFont")
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.standard_click() && this.context_menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -645,7 +883,8 @@ impl Render for FileManager {
                     })
                     .when(has_transfers, |view| {
                         view.child(self.render_transfer_panel())
-                    }),
+                    })
+                    .child(self.render_context_menu(cx)),
             )
     }
 }
@@ -700,6 +939,51 @@ fn toolbar_button(
         .cursor_pointer()
         .hover(|style| style.bg(rgb(0xe9ebef)))
         .child(label)
+}
+
+fn context_menu_item(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    danger: bool,
+) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(32.))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .text_color(rgb(if danger { 0xc73535 } else { TEXT }))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0xe8eaf0)))
+        .child(label.into())
+}
+
+fn move_to_trash(paths: &[PathBuf]) -> anyhow::Result<()> {
+    let mut command = Command::new("/usr/bin/osascript");
+    command
+        .arg("-e")
+        .arg("on run argv")
+        .arg("-e")
+        .arg("tell application \"Finder\"")
+        .arg("-e")
+        .arg("repeat with itemPath in argv")
+        .arg("-e")
+        .arg("delete (POSIX file (itemPath as text))")
+        .arg("-e")
+        .arg("end repeat")
+        .arg("-e")
+        .arg("end tell")
+        .arg("-e")
+        .arg("end run");
+    for path in paths {
+        command.arg(path);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        anyhow::bail!(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(())
 }
 
 fn home_dir() -> PathBuf {
