@@ -1,0 +1,25 @@
+[package]
+name = "filemanager"
+version = "0.1.0"
+edition = "2024"
+description = "A modern Finder-inspired file manager for macOS, built with GPUI"
+license = "MIT"
+
+[[bin]]
+name = "filemanager"
+path = "src/main.rs"
+required-features = ["ui"]
+
+[features]
+default = ["ui"]
+ui = ["dep:gpui"]
+
+[dependencies]
+anyhow = "1"
+gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
