@@ -8,9 +8,16 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransferState {
+    Preparing,
     Running,
     Completed,
     Failed(String),
+}
+
+impl TransferState {
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed(_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -36,16 +43,28 @@ pub type SharedProgress = Arc<Mutex<TransferProgress>>;
 
 pub fn start_copy(source: PathBuf, destination_dir: PathBuf) -> SharedProgress {
     let destination = destination_dir.join(source.file_name().unwrap_or_default());
-    let total_bytes = total_size(&source).unwrap_or(0);
     let progress = Arc::new(Mutex::new(TransferProgress {
         source: source.clone(),
         destination: destination.clone(),
         copied_bytes: 0,
-        total_bytes,
-        state: TransferState::Running,
+        total_bytes: 0,
+        state: TransferState::Preparing,
     }));
     let worker_progress = Arc::clone(&progress);
     thread::spawn(move || {
+        let total_bytes = match total_size(&source) {
+            Ok(total_bytes) => total_bytes,
+            Err(error) => {
+                if let Ok(mut value) = worker_progress.lock() {
+                    value.state = TransferState::Failed(error.to_string());
+                }
+                return;
+            }
+        };
+        if let Ok(mut value) = worker_progress.lock() {
+            value.total_bytes = total_bytes;
+            value.state = TransferState::Running;
+        }
         let result = copy_path(&source, &destination, &worker_progress);
         if let Ok(mut value) = worker_progress.lock() {
             value.state = match result {
@@ -118,7 +137,7 @@ mod tests {
         let started = Instant::now();
         loop {
             let state = progress.lock().unwrap().state.clone();
-            if state != TransferState::Running {
+            if state.is_finished() {
                 assert_eq!(state, TransferState::Completed);
                 break;
             }
@@ -129,6 +148,9 @@ mod tests {
             fs::read(destination_dir.join("hello.txt")).unwrap(),
             b"hello"
         );
+        let final_progress = progress.lock().unwrap();
+        assert_eq!(final_progress.copied_bytes, final_progress.total_bytes);
+        assert_eq!(final_progress.fraction(), 1.0);
         let _ = fs::remove_dir_all(root);
     }
 }

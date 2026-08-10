@@ -64,6 +64,28 @@ impl Render for DraggedFile {
     }
 }
 
+#[derive(Clone)]
+struct DraggedPane {
+    index: usize,
+    title: String,
+}
+
+impl Render for DraggedPane {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_4()
+            .py_2()
+            .rounded_lg()
+            .bg(rgba(0xf8fbfff2))
+            .border_2()
+            .border_color(rgb(ACCENT))
+            .shadow_lg()
+            .text_sm()
+            .text_color(rgb(TEXT))
+            .child(format!("↔  {}", self.title))
+    }
+}
+
 struct FileManager {
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -73,23 +95,7 @@ struct FileManager {
 }
 
 impl FileManager {
-    fn new(cx: &mut Context<Self>) -> Self {
-        cx.spawn(async move |this, cx| {
-            loop {
-                Timer::after(Duration::from_millis(100)).await;
-                if this
-                    .update(cx, |this, cx| {
-                        if !this.transfers.is_empty() {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
+    fn new(_: &mut Context<Self>) -> Self {
         let home = home_dir();
         Self {
             tabs: vec![Tab::new(home)],
@@ -155,6 +161,17 @@ impl FileManager {
         cx.notify();
     }
 
+    fn move_pane(&mut self, from: usize, target: usize, cx: &mut Context<Self>) {
+        if from == target || from >= self.tabs.len() || target >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        let insert_at = target.min(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
+        self.active_tab = insert_at;
+        cx.notify();
+    }
+
     fn start_transfer(&mut self, source: PathBuf, tab_index: usize, cx: &mut Context<Self>) {
         let destination = self.tabs[tab_index].path.clone();
         if source.parent() == Some(destination.as_path()) {
@@ -162,9 +179,36 @@ impl FileManager {
             cx.notify();
             return;
         }
-        self.transfers.push(start_copy(source, destination));
+        let progress = start_copy(source, destination.clone());
+        self.transfers.push(progress.clone());
         self.status = None;
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(100)).await;
+                let finished = progress
+                    .lock()
+                    .map(|value| value.state.is_finished())
+                    .unwrap_or(true);
+                if this
+                    .update(cx, |this, cx| {
+                        if finished {
+                            for tab in this.tabs.iter_mut().filter(|tab| tab.path == destination) {
+                                tab.entries = read_directory(&destination).unwrap_or_default();
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn connect_server(&mut self, cx: &mut Context<Self>) {
@@ -280,6 +324,10 @@ impl FileManager {
     ) -> impl IntoElement {
         let path = tab.path.clone();
         let active = tab_index == self.active_tab;
+        let dragged_pane = DraggedPane {
+            index: tab_index,
+            title: tab.title(),
+        };
         div()
             .h(px(82.))
             .w_full()
@@ -299,12 +347,16 @@ impl FileManager {
                     .text_color(rgb(TEXT))
                     .child(
                         div()
+                            .id(("pane-handle", tab_index))
                             .flex()
                             .items_center()
                             .gap_2()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .cursor_move()
+                            .child("⠿")
                             .child("📁")
-                            .child(tab.title()),
+                            .child(tab.title())
+                            .on_drag(dragged_pane, |pane, _, _, cx| cx.new(|_| pane.clone())),
                     )
                     .child(
                         div()
@@ -473,6 +525,9 @@ impl FileManager {
                                 this.active_tab = tab_index;
                                 this.start_transfer(file.path.clone(), tab_index, cx);
                             }))
+                            .on_drop(cx.listener(move |this, pane: &DraggedPane, _, cx| {
+                                this.move_pane(pane.index, tab_index, cx);
+                            }))
                     }),
             )
     }
@@ -500,6 +555,11 @@ impl FileManager {
                     .child("ファイル転送"),
             )
             .children(snapshots.into_iter().rev().take(4).map(|progress| {
+                let transfer_id = SharedString::from(format!(
+                    "transfer-{}-{}",
+                    progress.source.display(),
+                    progress.destination.display()
+                ));
                 let name = progress
                     .source
                     .file_name()
@@ -507,11 +567,20 @@ impl FileManager {
                     .unwrap_or("項目");
                 let fraction = progress.fraction();
                 let label = match &progress.state {
-                    TransferState::Running => format!("{}%", (fraction * 100.0) as u32),
-                    TransferState::Completed => "完了".into(),
+                    TransferState::Preparing => "準備中…".into(),
+                    TransferState::Running => format!(
+                        "{}% · {} / {}",
+                        (fraction * 100.0) as u32,
+                        format_bytes(progress.copied_bytes),
+                        format_bytes(progress.total_bytes)
+                    ),
+                    TransferState::Completed => {
+                        format!("完了 · {}", format_bytes(progress.total_bytes))
+                    }
                     TransferState::Failed(_) => "失敗".into(),
                 };
                 div()
+                    .id(transfer_id)
                     .mt_3()
                     .child(
                         div()
@@ -637,6 +706,18 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("/").to_path_buf())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn main() {
