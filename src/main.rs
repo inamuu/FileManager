@@ -104,17 +104,22 @@ impl FileManager {
         &self.tabs[self.active_tab]
     }
 
-    fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn navigate_tab(&mut self, tab_index: usize, path: PathBuf, cx: &mut Context<Self>) {
         if path.is_dir() {
-            self.tabs[self.active_tab] = Tab::new(path);
+            self.tabs[tab_index] = Tab::new(path);
+            self.active_tab = tab_index;
             self.status = None;
             cx.notify();
         }
     }
 
-    fn open_entry(&mut self, entry: &FileEntry, cx: &mut Context<Self>) {
+    fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.navigate_tab(self.active_tab, path, cx);
+    }
+
+    fn open_entry(&mut self, tab_index: usize, entry: &FileEntry, cx: &mut Context<Self>) {
         if entry.is_dir {
-            self.navigate(entry.path.clone(), cx);
+            self.navigate_tab(tab_index, entry.path.clone(), cx);
         } else if Command::new("/usr/bin/open")
             .arg(&entry.path)
             .spawn()
@@ -125,9 +130,9 @@ impl FileManager {
         }
     }
 
-    fn go_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(parent) = self.active().path.parent() {
-            self.navigate(parent.to_path_buf(), cx);
+    fn go_back(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        if let Some(parent) = self.tabs[tab_index].path.parent() {
+            self.navigate_tab(tab_index, parent.to_path_buf(), cx);
         }
     }
 
@@ -142,7 +147,11 @@ impl FileManager {
             return;
         }
         self.tabs.remove(index);
-        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        if index < self.active_tab {
+            self.active_tab -= 1;
+        } else if index == self.active_tab {
+            self.active_tab = index.min(self.tabs.len() - 1);
+        }
         cx.notify();
     }
 
@@ -214,105 +223,150 @@ impl FileManager {
             )
     }
 
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pane_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .h(px(42.))
+            .h(px(46.))
             .w_full()
             .flex()
-            .items_end()
-            .gap_1()
-            .px_3()
+            .items_center()
+            .justify_between()
+            .px_4()
             .bg(rgb(0xedeef1))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                let active = index == self.active_tab;
+            .child(
                 div()
-                    .id(("tab", index))
-                    .h(px(34.))
-                    .min_w(px(140.))
-                    .max_w(px(220.))
-                    .px_3()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .rounded_t_lg()
-                    .bg(rgb(if active { CARD } else { 0xe2e4e8 }))
-                    .text_color(rgb(if active { TEXT } else { MUTED }))
+                    .gap_2()
                     .text_sm()
-                    .cursor_pointer()
-                    .child(format!("📁  {}", tab.title()))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("横並び表示")
                     .child(
                         div()
-                            .id(("close-tab", index))
-                            .px_1()
-                            .rounded_sm()
-                            .hover(|style| style.bg(rgb(0xd2d5db)))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _, _, cx| this.close_tab(index, cx))),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_tab = index;
-                        cx.notify();
-                    }))
-                    .on_drop(cx.listener(move |this, file: &DraggedFile, _, cx| {
-                        this.start_transfer(file.path.clone(), index, cx);
-                    }))
-            }))
+                            .px_2()
+                            .py_1()
+                            .rounded_full()
+                            .bg(rgb(0xd9dce2))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} ペイン", self.tabs.len())),
+                    ),
+            )
             .child(
                 div()
                     .id("new-tab")
-                    .h(px(30.))
+                    .h(px(32.))
                     .px_3()
                     .flex()
                     .items_center()
                     .rounded_md()
-                    .text_lg()
-                    .text_color(rgb(MUTED))
-                    .hover(|style| style.bg(rgb(0xdfe1e5)))
+                    .bg(rgb(ACCENT))
+                    .text_sm()
+                    .text_color(rgb(0xffffff))
+                    .hover(|style| style.bg(rgb(0x2468df)))
                     .cursor_pointer()
-                    .child("＋")
+                    .child("＋  ペインを追加")
                     .on_click(cx.listener(|this, _, _, cx| this.add_tab(cx))),
             )
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pane_toolbar(
+        &self,
+        tab_index: usize,
+        tab: &Tab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = tab.path.clone();
+        let active = tab_index == self.active_tab;
         div()
-            .h(px(52.))
+            .h(px(82.))
             .w_full()
             .flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .bg(rgb(CARD))
+            .flex_col()
+            .bg(rgb(if active { 0xf8fbff } else { CARD }))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(toolbar_button("‹").on_click(cx.listener(|this, _, _, cx| this.go_back(cx))))
-            .child(toolbar_button("›").text_color(rgb(0xb8bbc2)))
             .child(
                 div()
-                    .ml_2()
-                    .flex_1()
-                    .h(px(32.))
+                    .h(px(40.))
                     .flex()
                     .items_center()
+                    .justify_between()
                     .px_3()
-                    .rounded_lg()
-                    .bg(rgb(BG))
-                    .border_1()
-                    .border_color(rgb(BORDER))
                     .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child(self.active().path.display().to_string()),
+                    .text_color(rgb(TEXT))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("📁")
+                            .child(tab.title()),
+                    )
+                    .child(
+                        div()
+                            .id(("close-pane", tab_index))
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .text_color(rgb(MUTED))
+                            .hover(|style| style.bg(rgb(0xe2e5ea)))
+                            .cursor_pointer()
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(tab_index, cx);
+                            })),
+                    ),
             )
-            .child(toolbar_button("↻").on_click(cx.listener(|this, _, _, cx| {
-                let path = this.active().path.clone();
-                this.navigate(path, cx);
-            })))
+            .child(
+                div()
+                    .h(px(42.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .child(
+                        toolbar_button(("back", tab_index), "‹").on_click(
+                            cx.listener(move |this, _, _, cx| this.go_back(tab_index, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(30.))
+                            .flex()
+                            .items_center()
+                            .px_3()
+                            .rounded_lg()
+                            .bg(rgb(BG))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .overflow_hidden()
+                            .child(tab.path.display().to_string()),
+                    )
+                    .child(
+                        toolbar_button(("refresh", tab_index), "↻").on_click(cx.listener(
+                            move |this, _, _, cx| this.navigate_tab(tab_index, path.clone(), cx),
+                        )),
+                    ),
+            )
     }
 
-    fn render_file_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entries = self.active().entries.clone();
+    fn render_file_list(
+        &self,
+        tab_index: usize,
+        tab: &Tab,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entries = tab.entries.clone();
         div()
             .flex_1()
             .w_full()
@@ -331,57 +385,96 @@ impl FileManager {
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .child(div().flex_1().child("名前"))
-                    .child(div().w(px(110.)).child("サイズ"))
-                    .child(div().w(px(120.)).child("種類")),
+                    .child(div().w(px(90.)).child("サイズ")),
             )
-            .child(div().id("file-list").flex_1().overflow_y_scroll().children(
-                entries.into_iter().enumerate().map(|(index, entry)| {
-                    let dragged = DraggedFile {
-                        path: entry.path.clone(),
-                        name: entry.name.clone(),
-                    };
-                    let clicked = entry.clone();
-                    div()
-                        .id(("entry", index))
-                        .h(px(38.))
-                        .flex()
-                        .items_center()
-                        .px_4()
-                        .border_b_1()
-                        .border_color(rgb(0xf0f1f3))
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0xf1f6ff)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(div().w(px(28.)).child(entry.icon()))
-                                .child(entry.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .w(px(110.))
-                                .text_color(rgb(MUTED))
-                                .child(entry.formatted_size()),
-                        )
-                        .child(
-                            div()
-                                .w(px(120.))
-                                .text_color(rgb(MUTED))
-                                .child(if entry.is_dir {
-                                    "フォルダ"
-                                } else {
-                                    "ファイル"
-                                }),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_entry(&clicked, cx)))
-                        .on_drag(dragged, |file, _, _, cx| cx.new(|_| file.clone()))
-                }),
-            ))
+            .child(
+                div()
+                    .id(("file-list", tab_index))
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children(entries.into_iter().enumerate().map(|(index, entry)| {
+                        let dragged = DraggedFile {
+                            path: entry.path.clone(),
+                            name: entry.name.clone(),
+                        };
+                        let clicked = entry.clone();
+                        div()
+                            .id(SharedString::from(format!("entry-{tab_index}-{index}")))
+                            .h(px(38.))
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .border_b_1()
+                            .border_color(rgb(0xf0f1f3))
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0xf1f6ff)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(div().w(px(28.)).child(entry.icon()))
+                                    .child(entry.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(90.))
+                                    .text_color(rgb(MUTED))
+                                    .child(entry.formatted_size()),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_entry(tab_index, &clicked, cx)
+                            }))
+                            .on_drag(dragged, |file, _, _, cx| cx.new(|_| file.clone()))
+                    })),
+            )
+    }
+
+    fn render_panes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("panes")
+            .flex_1()
+            .w_full()
+            .flex()
+            .gap_2()
+            .p_2()
+            .overflow_x_scroll()
+            .bg(rgb(BG))
+            .children(
+                self.tabs
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(tab_index, tab)| {
+                        let active = tab_index == self.active_tab;
+                        div()
+                            .id(("pane", tab_index))
+                            .min_w(px(360.))
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .rounded_xl()
+                            .bg(rgb(CARD))
+                            .border_2()
+                            .border_color(rgb(if active { ACCENT } else { BORDER }))
+                            .shadow_sm()
+                            .child(self.render_pane_toolbar(tab_index, &tab, cx))
+                            .child(self.render_file_list(tab_index, &tab, cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.active_tab = tab_index;
+                                cx.notify();
+                            }))
+                            .on_drop(cx.listener(move |this, file: &DraggedFile, _, cx| {
+                                this.active_tab = tab_index;
+                                this.start_transfer(file.path.clone(), tab_index, cx);
+                            }))
+                    }),
+            )
     }
 
     fn render_transfer_panel(&self) -> impl IntoElement {
@@ -464,9 +557,8 @@ impl Render for FileManager {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(self.render_tabs(cx))
-                    .child(self.render_toolbar(cx))
-                    .child(self.render_file_list(cx))
+                    .child(self.render_pane_bar(cx))
+                    .child(self.render_panes(cx))
                     .when_some(status, |view, message| {
                         view.child(
                             div()
@@ -522,10 +614,13 @@ fn sidebar_item(
         .child(name)
 }
 
-fn toolbar_button(label: impl Into<SharedString>) -> Stateful<gpui::Div> {
+fn toolbar_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+) -> Stateful<gpui::Div> {
     let label = label.into();
     div()
-        .id(label.clone())
+        .id(id)
         .size(px(30.))
         .flex()
         .items_center()
