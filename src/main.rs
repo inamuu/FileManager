@@ -5,9 +5,10 @@ use filemanager::{
     transfer::{SharedProgress, TransferState, start_copy},
 };
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, IntoElement, Modifiers, MouseButton,
-    MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString, Stateful,
-    Timer, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, rgba, size,
+    App, Application, Bounds, ClickEvent, Context, FocusHandle, IntoElement, KeyDownEvent,
+    Modifiers, MouseButton, MouseUpEvent, Pixels, Point, PromptLevel, Render, ScrollHandle,
+    SharedString, Stateful, Timer, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+    relative, rgb, rgba, size,
 };
 use std::{
     collections::BTreeSet,
@@ -115,10 +116,11 @@ struct FileManager {
     transfers: Vec<SharedProgress>,
     status: Option<String>,
     context_menu: Option<ContextMenu>,
+    focus_handle: FocusHandle,
 }
 
 impl FileManager {
-    fn new(_: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let home = home_dir();
         Self {
             tabs: vec![Tab::new(home)],
@@ -127,6 +129,7 @@ impl FileManager {
             transfers: Vec::new(),
             status: None,
             context_menu: None,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -254,7 +257,7 @@ impl FileManager {
         &mut self,
         tab_index: usize,
         row: usize,
-        event: &MouseDownEvent,
+        position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         if !self.tabs[tab_index]
@@ -265,12 +268,57 @@ impl FileManager {
         }
         let paths = self.tabs[tab_index].selected.iter().cloned().collect();
         self.context_menu = Some(ContextMenu {
-            position: event.position,
+            position,
             tab_index,
             paths,
         });
         self.active_tab = tab_index;
         cx.notify();
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let tab_index = self.active_tab;
+        let tab = &self.tabs[tab_index];
+        if tab.entries.is_empty() {
+            return;
+        }
+
+        let current = tab.selection_anchor.or_else(|| {
+            tab.entries
+                .iter()
+                .position(|entry| tab.selected.contains(&entry.path))
+        });
+
+        let target = match event.keystroke.key.as_str() {
+            "up" => current.unwrap_or(0).saturating_sub(1),
+            "down" => current
+                .map(|index| (index + 1).min(tab.entries.len() - 1))
+                .unwrap_or(0),
+            "enter" | "return" => {
+                if let Some(index) = current {
+                    let entry = self.tabs[tab_index].entries[index].clone();
+                    self.open_entry(tab_index, &entry, cx);
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            "escape" => {
+                if self.context_menu.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                return;
+            }
+            _ => return,
+        };
+
+        let modifiers = Modifiers {
+            shift: event.keystroke.modifiers.shift,
+            ..Modifiers::default()
+        };
+        self.select_entry(tab_index, target, modifiers, cx);
+        self.tabs[tab_index].scroll_handle.scroll_to_item(target);
+        cx.stop_propagation();
     }
 
     fn open_context_item(&mut self, cx: &mut Context<Self>) {
@@ -657,13 +705,15 @@ impl FileManager {
                                     .text_color(rgb(MUTED))
                                     .child(entry.formatted_size()),
                             )
-                            .on_click(cx.listener(move |this, event, _, cx| {
-                                this.click_entry(tab_index, index, &clicked, event, cx)
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                this.focus_handle.focus(window);
+                                this.click_entry(tab_index, index, &clicked, event, cx);
                             }))
-                            .on_mouse_down(
+                            .on_mouse_up(
                                 MouseButton::Right,
-                                cx.listener(move |this, event, _, cx| {
-                                    this.show_context_menu(tab_index, index, event, cx)
+                                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                                    this.focus_handle.focus(window);
+                                    this.show_context_menu(tab_index, index, event.position, cx);
                                 }),
                             )
                             .on_drag(dragged, |file, _, _, cx| cx.new(|_| file.clone()))
@@ -851,6 +901,16 @@ impl Render for FileManager {
             .flex()
             .bg(rgb(BG))
             .font_family(".SystemUIFont")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| this.focus_handle.focus(window)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, window, _| this.focus_handle.focus(window)),
+            )
             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                 if event.standard_click() && this.context_menu.take().is_some() {
                     cx.notify();
