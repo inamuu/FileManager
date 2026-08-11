@@ -199,6 +199,25 @@ impl FileManager {
         cx.notify();
     }
 
+    fn select_pane(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.tabs.len() {
+            self.active_tab = index;
+            self.context_menu = None;
+            cx.notify();
+        }
+    }
+
+    fn cycle_pane(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let next = if backwards {
+            self.active_tab
+                .checked_sub(1)
+                .unwrap_or(self.tabs.len() - 1)
+        } else {
+            (self.active_tab + 1) % self.tabs.len()
+        };
+        self.select_pane(next, cx);
+    }
+
     fn select_entry(
         &mut self,
         tab_index: usize,
@@ -279,7 +298,86 @@ impl FileManager {
         cx.notify();
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+
+        if modifiers.control && key == "tab" {
+            self.cycle_pane(modifiers.shift, cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if modifiers.platform {
+            if modifiers.alt {
+                let target = match key {
+                    "left" => self.active_tab.checked_sub(1),
+                    "right" if self.active_tab + 1 < self.tabs.len() => Some(self.active_tab + 1),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    self.move_pane(self.active_tab, target, cx);
+                }
+                if matches!(key, "left" | "right") {
+                    cx.stop_propagation();
+                }
+                return;
+            }
+
+            if modifiers.shift && matches!(key, "[" | "]") {
+                self.cycle_pane(key == "[", cx);
+                cx.stop_propagation();
+                return;
+            }
+
+            if let Some(index) = key
+                .chars()
+                .next()
+                .filter(|_| key.len() == 1)
+                .and_then(|key| key.to_digit(10))
+                .filter(|index| (1..=9).contains(index))
+                .map(|index| index as usize - 1)
+            {
+                self.select_pane(index, cx);
+                cx.stop_propagation();
+                return;
+            }
+
+            match key {
+                "t" => self.add_tab(cx),
+                "w" => self.close_tab(self.active_tab, cx),
+                "a" => {
+                    let tab = &mut self.tabs[self.active_tab];
+                    tab.selected = tab.entries.iter().map(|entry| entry.path.clone()).collect();
+                    tab.selection_anchor = (!tab.entries.is_empty()).then_some(0);
+                    self.context_menu = None;
+                    cx.notify();
+                }
+                "r" => {
+                    let path = self.active().path.clone();
+                    self.navigate_tab(self.active_tab, path, cx);
+                }
+                "k" => self.connect_server(cx),
+                "backspace" | "delete" => {
+                    let paths = self.tabs[self.active_tab]
+                        .selected
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.confirm_delete_paths(paths, window, cx);
+                }
+                "up" => self.go_back(self.active_tab, cx),
+                "down" => {
+                    if let Some(entry) = self.selected_entry(self.active_tab) {
+                        self.open_entry(self.active_tab, &entry, cx);
+                    }
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         let tab_index = self.active_tab;
         let tab = &self.tabs[tab_index];
         if tab.entries.is_empty() {
@@ -292,7 +390,7 @@ impl FileManager {
                 .position(|entry| tab.selected.contains(&entry.path))
         });
 
-        let target = match event.keystroke.key.as_str() {
+        let target = match key {
             "up" => current.unwrap_or(0).saturating_sub(1),
             "down" => current
                 .map(|index| (index + 1).min(tab.entries.len() - 1))
@@ -322,6 +420,19 @@ impl FileManager {
         self.select_entry(tab_index, target, modifiers, cx);
         self.tabs[tab_index].scroll_handle.scroll_to_item(target);
         cx.stop_propagation();
+    }
+
+    fn selected_entry(&self, tab_index: usize) -> Option<FileEntry> {
+        let tab = &self.tabs[tab_index];
+        tab.selection_anchor
+            .and_then(|index| tab.entries.get(index))
+            .filter(|entry| tab.selected.contains(&entry.path))
+            .or_else(|| {
+                tab.entries
+                    .iter()
+                    .find(|entry| tab.selected.contains(&entry.path))
+            })
+            .cloned()
     }
 
     fn open_context_item(&mut self, cx: &mut Context<Self>) {
@@ -360,7 +471,19 @@ impl FileManager {
         let Some(menu) = self.context_menu.take() else {
             return;
         };
-        let count = menu.paths.len();
+        self.confirm_delete_paths(menu.paths, window, cx);
+    }
+
+    fn confirm_delete_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
         let prompt = window.prompt(
             PromptLevel::Warning,
             &format!("選択した{count}項目をゴミ箱に入れますか？"),
@@ -368,7 +491,6 @@ impl FileManager {
             &["ゴミ箱に入れる", "キャンセル"],
             cx,
         );
-        let paths = menu.paths;
         cx.spawn(async move |this, cx| {
             if prompt.await.unwrap_or(1) != 0 {
                 return;
@@ -1097,6 +1219,108 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Keystroke, TestAppContext};
+
+    #[gpui::test]
+    fn pane_shortcuts_add_close_select_cycle_and_move(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let file_manager = FileManager::new(cx);
+                    file_manager.focus_handle.focus(window);
+                    file_manager
+                })
+            })
+            .unwrap()
+        });
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-t").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-t").unwrap());
+        window
+            .update(cx, |file_manager, _, _| {
+                assert_eq!(file_manager.tabs.len(), 3);
+                assert_eq!(file_manager.active_tab, 2);
+                file_manager.tabs[0].path = PathBuf::from("/tmp/pane-one");
+                file_manager.tabs[1].path = PathBuf::from("/tmp/pane-two");
+                file_manager.tabs[2].path = PathBuf::from("/tmp/pane-three");
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-1").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-tab").unwrap());
+        window
+            .update(cx, |file_manager, _, _| {
+                assert_eq!(file_manager.active_tab, 1);
+                assert_eq!(file_manager.active().path, Path::new("/tmp/pane-two"));
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-alt-left").unwrap());
+        window
+            .update(cx, |file_manager, _, _| {
+                assert_eq!(file_manager.active_tab, 0);
+                assert_eq!(file_manager.active().path, Path::new("/tmp/pane-two"));
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-w").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-w").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-w").unwrap());
+        window
+            .update(cx, |file_manager, _, _| {
+                assert_eq!(file_manager.tabs.len(), 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn file_selection_shortcuts_move_and_select_all(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.new(|cx| {
+                    let mut file_manager = FileManager::new(cx);
+                    file_manager.tabs[0].entries = ["one.txt", "two.txt"]
+                        .into_iter()
+                        .map(|name| FileEntry {
+                            path: PathBuf::from("/tmp").join(name),
+                            name: name.into(),
+                            is_dir: false,
+                            size: 0,
+                            modified: 0,
+                        })
+                        .collect();
+                    file_manager.focus_handle.focus(window);
+                    file_manager
+                })
+            })
+            .unwrap()
+        });
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("down").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("down").unwrap());
+        window
+            .update(cx, |file_manager, _, _| {
+                assert_eq!(file_manager.tabs[0].selection_anchor, Some(1));
+                assert!(
+                    file_manager.tabs[0]
+                        .selected
+                        .contains(Path::new("/tmp/two.txt"))
+                );
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-a").unwrap());
+        window
+            .update(cx, |file_manager, _, _| {
+                assert_eq!(file_manager.tabs[0].selected.len(), 2);
+            })
+            .unwrap();
+    }
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
@@ -1109,7 +1333,13 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(FileManager::new),
+            |window, cx| {
+                cx.new(|cx| {
+                    let file_manager = FileManager::new(cx);
+                    file_manager.focus_handle.focus(window);
+                    file_manager
+                })
+            },
         )
         .expect("FileManager window could not be opened");
         cx.activate(true);
