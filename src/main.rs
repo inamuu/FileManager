@@ -1060,15 +1060,13 @@ fn move_to_trash(paths: &[PathBuf]) -> anyhow::Result<()> {
         .arg("-e")
         .arg("on run argv")
         .arg("-e")
-        .arg("tell application \"Finder\"")
-        .arg("-e")
         .arg("repeat with itemPath in argv")
         .arg("-e")
-        .arg("delete (POSIX file (itemPath as text))")
+        .arg("set itemFile to POSIX file (itemPath as text)")
+        .arg("-e")
+        .arg("tell application \"Finder\" to delete itemFile")
         .arg("-e")
         .arg("end repeat")
-        .arg("-e")
-        .arg("end tell")
         .arg("-e")
         .arg("end run");
     for path in paths {
