@@ -6,7 +6,7 @@ use filemanager::{
 };
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, FocusHandle, IntoElement, KeyDownEvent,
-    Modifiers, MouseButton, MouseUpEvent, Pixels, Point, PromptLevel, Render, ScrollHandle,
+    Modifiers, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Render, ScrollHandle,
     SharedString, Stateful, Timer, Window, WindowBounds, WindowOptions, div, prelude::*, px,
     relative, rgb, rgba, size,
 };
@@ -245,6 +245,9 @@ impl FileManager {
         cx: &mut Context<Self>,
     ) {
         if !event.standard_click() {
+            return;
+        }
+        if event.modifiers().control {
             return;
         }
         self.select_entry(tab_index, row, event.modifiers(), cx);
@@ -709,11 +712,25 @@ impl FileManager {
                                 this.focus_handle.focus(window);
                                 this.click_entry(tab_index, index, &clicked, event, cx);
                             }))
-                            .on_mouse_up(
+                            .on_mouse_down(
                                 MouseButton::Right,
-                                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                     this.focus_handle.focus(window);
                                     this.show_context_menu(tab_index, index, event.position, cx);
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    if event.modifiers.control {
+                                        this.focus_handle.focus(window);
+                                        this.show_context_menu(
+                                            tab_index,
+                                            index,
+                                            event.position,
+                                            cx,
+                                        );
+                                    }
                                 }),
                             )
                             .on_drag(dragged, |file, _, _, cx| cx.new(|_| file.clone()))
@@ -772,46 +789,61 @@ impl FileManager {
             )
     }
 
-    fn render_context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div().when_some(self.context_menu.clone(), |root, menu| {
-            root.child(
-                div()
-                    .absolute()
-                    .left(menu.position.x - px(224.))
-                    .top(menu.position.y)
-                    .w(px(220.))
-                    .p_1()
-                    .rounded_lg()
-                    .bg(rgba(0xfafafaf8))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .shadow_2xl()
-                    .text_sm()
-                    .text_color(rgb(TEXT))
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("{}項目を選択中", menu.paths.len())),
-                    )
-                    .child(
-                        context_menu_item("context-open", "開く", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.open_context_item(cx))),
-                    )
-                    .child(
-                        context_menu_item("context-reveal", "Finderで表示", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.reveal_context_item(cx))),
-                    )
-                    .child(div().h(px(1.)).mx_2().my_1().bg(rgb(BORDER)))
-                    .child(
-                        context_menu_item("context-trash", "ゴミ箱に入れる", true).on_click(
-                            cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
+    fn render_context_menu(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let window_size = window.bounds().size;
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .when_some(self.context_menu.clone(), |root, menu| {
+                let menu_left = (menu.position.x - px(224.))
+                    .min(window_size.width - px(452.))
+                    .max(px(8.));
+                let menu_top = menu
+                    .position
+                    .y
+                    .min(window_size.height - px(150.))
+                    .max(px(8.));
+                root.child(
+                    div()
+                        .absolute()
+                        .left(menu_left)
+                        .top(menu_top)
+                        .w(px(220.))
+                        .p_1()
+                        .rounded_lg()
+                        .bg(rgba(0xfafafaf8))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_2xl()
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(format!("{}項目を選択中", menu.paths.len())),
+                        )
+                        .child(
+                            context_menu_item("context-open", "開く", false)
+                                .on_click(cx.listener(|this, _, _, cx| this.open_context_item(cx))),
+                        )
+                        .child(
+                            context_menu_item("context-reveal", "Finderで表示", false).on_click(
+                                cx.listener(|this, _, _, cx| this.reveal_context_item(cx)),
+                            ),
+                        )
+                        .child(div().h(px(1.)).mx_2().my_1().bg(rgb(BORDER)))
+                        .child(
+                            context_menu_item("context-trash", "ゴミ箱に入れる", true).on_click(
+                                cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
+                            ),
                         ),
-                    ),
-            )
-        })
+                )
+            })
     }
 
     fn render_transfer_panel(&self) -> impl IntoElement {
@@ -892,7 +924,7 @@ impl FileManager {
 }
 
 impl Render for FileManager {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_transfers = !self.transfers.is_empty();
         let status = self.status.clone();
         div()
@@ -912,7 +944,10 @@ impl Render for FileManager {
                 cx.listener(|this, _, window, _| this.focus_handle.focus(window)),
             )
             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                if event.standard_click() && this.context_menu.take().is_some() {
+                if event.standard_click()
+                    && !event.modifiers().control
+                    && this.context_menu.take().is_some()
+                {
                     cx.notify();
                 }
             }))
@@ -944,7 +979,7 @@ impl Render for FileManager {
                     .when(has_transfers, |view| {
                         view.child(self.render_transfer_panel())
                     })
-                    .child(self.render_context_menu(cx)),
+                    .child(self.render_context_menu(window, cx)),
             )
     }
 }
